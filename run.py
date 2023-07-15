@@ -2,6 +2,7 @@ import diffrax as dfx
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import lineax as lx
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
@@ -32,14 +33,13 @@ def _vector_field(
     return dx, dv
 
 
-def _solve_ivp(
+def _solve_single_ivp(
     t0: FloatScalar,
     t1: FloatScalar,
     x0: ArrayM,
     v0: ArrayM,
     christoffel: Callable[[ArrayM], ArrayMMM],
-    saveat: dfx.SaveAt,
-) -> dfx.Solution:
+) -> tuple[ArrayM, ArrayM]:
     term = dfx.ODETerm(_vector_field)
     solver = dfx.Tsit5(scan_kind="lax")  # TODO
     dt0 = None
@@ -56,40 +56,50 @@ def _solve_ivp(
         y0,
         args=christoffel,
         stepsize_controller=stepsize_controller,
-        saveat=saveat,
         adjoint=dfx.DirectAdjoint(),  # TODO
-        max_steps=16**5,
     )
-    return sol
-
-
-def _solve_ivp_t1(
-    t0: FloatScalar,
-    t1: FloatScalar,
-    x0: ArrayM,
-    v0: ArrayM,
-    christoffel: Callable[[ArrayM], ArrayMMM],
-) -> tuple[ArrayM, ArrayM]:
-    saveat = dfx.SaveAt(t1=True)
-    sol = _solve_ivp(t0, t1, x0, v0, christoffel, saveat)
     (xs, vs) = sol.ys
     (x1,) = xs
     (v1,) = vs
     return x1, v1
 
 
+def _vector_field_with_length(t, y, args):
+    (x, v), _ = y
+    metric, args = args
+    dx, dv = _vector_field(t, (x, v), args)
+    dlength = jnp.sqrt(jnp.dot(v, metric(x).mv(v)))
+    return (dx, dv), dlength
+
+
 @eqx.filter_jit
-def solve_ivp_dense(
-    t0: FloatScalar,
-    t1: FloatScalar,
-    x0: ArrayM,
-    v0: ArrayM,
-    christoffel: Callable[[ArrayM], ArrayMMM],
-) -> Callable[[FloatScalar], ArrayM]:
-    saveat = dfx.SaveAt(dense=True)
-    sol = _solve_ivp(t0, t1, x0, v0, christoffel, saveat)
-    # Drop the velocity component
-    return eqx.Partial(lambda f, x: f(x)[0], sol.evaluate)
+def solve_inference_ivp(v0: ArrayM, metric: Callable[[ArrayM], lx.AbstractLinearOperator], christoffel: Callable[[ArrayM], ArrayMMM]) -> tuple[Float[Array, "100 M"], FloatScalar]:
+    term = dfx.ODETerm(_vector_field_with_length)
+    solver = dfx.Tsit5()
+    t0 = 0
+    t1 = 1
+    dt0 = None
+    y0 = (jnp.zeros_like(v0), v0)
+    stepsize_controller = dfx.PIDController(
+        rtol=1e-8, atol=1e-8, pcoeff=0.4, icoeff=0.3
+    )
+    trajectory_saveat = dfx.SubSaveAt(ts=jnp.linspace(t0, t1, 100), fn=lambda t, y, args: y[0][0])
+    length_saveat = dfx.SubSaveAt(t1=True, fn=lambda t, y, args: y[1])
+    saveat = dfx.SaveAt(subs=(trajectory_saveat, length_saveat))
+    sol = dfx.diffeqsolve(
+        term,
+        solver,
+        t0,
+        t1,
+        dt0,
+        (y0, 0),
+        args=(metric, christoffel),
+        stepsize_controller=stepsize_controller,
+        saveat=saveat,
+        max_steps=16**5,
+    )
+    xs, (length,) = sol.ys
+    return xs, length
 
 
 def _solve_init(
@@ -174,7 +184,7 @@ def solve_bvp(
     def _root_fn(later_x0s: Float[Array, "pieces-1 M"], v0s: Float[Array, "pieces M"]):  # M * (2 * pieces - 1) inputs
         zero = jnp.zeros((1, M), target.dtype)
         x0s = jnp.concatenate([zero, later_x0s])
-        (x1s, v1s) = eqx.filter_vmap(_solve_ivp_t1)(t0s, t1s, x0s, v0s, christoffel)
+        (x1s, v1s) = eqx.filter_vmap(_solve_single_ivp)(t0s, t1s, x0s, v0s, christoffel)
         if canonicalise is not None:
             x0s = jax.vmap(canonicalise)(x0s)
             x1s = jax.vmap(canonicalise)(x1s)
@@ -199,10 +209,15 @@ def solve_bvp(
 # Source: https://www.geometrictools.com/Documentation/RiemannianGeodesics.pdf
 def manifold_to_metric(
     manifold: Callable[[ArrayM], Array1D]
-) -> Callable[[ArrayM], ArrayMM]:
+) -> Callable[[ArrayM], lx.AbstractLinearOperator]:
+    def manifold_with_args(x, args):
+        del args
+        return manifold(x)
+
     @jax.jit
     def metric(x: ArrayM) -> ArrayMM:
-        jac: Float[Array, "_ M"] = jax.jacfwd(manifold)(x)
+        jac = lx.JacobianLinearOperator(manifold_with_args, x)
+        jac = lx.linearise(jac)
         return jac.T @ jac
 
     return metric
@@ -210,10 +225,13 @@ def manifold_to_metric(
 
 # Source: https://www.geometrictools.com/Documentation/RiemannianGeodesics.pdf
 def metric_to_christoffel(
-    metric: Callable[[ArrayM], ArrayMM]
+    metric: Callable[[ArrayM], lx.AbstractLinearOperator]
 ) -> Callable[[ArrayM], ArrayMMM]:
+    def materialised_metric(x):
+        return metric(x).as_matrix()
+
     def christoffel_first_kind(x: ArrayM) -> ArrayMMM:
-        jac_ijk: ArrayMMM = jax.jacfwd(metric)(x)
+        jac_ijk: ArrayMMM = jax.jacfwd(materialised_metric)(x)
         jac_jki = jnp.transpose(jac_ijk, (1, 2, 0))
         jac_kij = jnp.transpose(jac_ijk, (2, 0, 1))
         return 0.5 * (jac_jki + jac_kij - jac_ijk)
@@ -221,7 +239,7 @@ def metric_to_christoffel(
     @jax.jit
     def christoffel_second_kind(x: ArrayM) -> ArrayMMM:
         Γ: ArrayMMM = christoffel_first_kind(x)
-        g: ArrayMM = metric(x)
+        g: ArrayMM = materialised_metric(x)
         g_inv = jnp.linalg.inv(g)
         return jnp.tensordot(g_inv, Γ, axes=((1,), (2,)))
 
@@ -248,13 +266,12 @@ def demo_torus():
         return jnp.stack([x, y, z])
 
     # Or `metric = manifold_to_metric(manifold)`, but this is more efficient.
-    def metric(x: Float[Array, "2"]) -> Float[Array, "2 2"]:
+    def metric(x: Float[Array, "2"]) -> lx.AbstractLinearOperator:
         assert x.shape == (2,)
         _, φ = x
         g_θθ = (R + r * jnp.cos(φ)) ** 2
-        g_θφ = g_φθ = 0
         g_φφ = r**2
-        return jnp.array([[g_θθ, g_θφ], [g_φθ, g_φφ]])
+        return lx.DiagonalLinearOperator(jnp.array([g_θθ, g_φφ]))
 
     # Or `christoffel = metric_to_christoffel(metric)`, but this is more efficient.
     def christoffel(x: Float[Array, "2"]) -> Float[Array, "2 2 2"]:
@@ -279,8 +296,8 @@ def demo_torus():
     v0 = solve_bvp(
         target, pieces, christoffel, canonicalise
     )
-    sol = solve_ivp_dense(0, 1, jnp.zeros_like(target), v0, christoffel)
-    xs = jax.vmap(sol)(jnp.linspace(0, 1, 100))
+    xs, length = solve_inference_ivp(v0, metric, christoffel)
+    print(f"length={length.item():.3f}")
     x_path, y_path, z_path = jax.vmap(manifold, out_axes=1)(xs)
     x0, y0, z0 = manifold(jnp.zeros_like(target))
     x_target, y_target, z_target = manifold(target)
@@ -288,18 +305,25 @@ def demo_torus():
     surface = np.mgrid[0.0 : 2 * np.pi : 100j, 0.0 : 2 * np.pi : 100j]
     x_surface, y_surface, z_surface = jax.vmap(jax.vmap(manifold, in_axes=1, out_axes=1), in_axes=1, out_axes=1)(surface)
     fig = plt.figure()
-    ax = fig.add_subplot(111, projection="3d")
+    ax = fig.add_subplot(121, projection="3d")
     ax.plot_surface(
         x_surface, y_surface, z_surface, rstride=1, cstride=1, color="c", linewidth=0
     )
     ax.plot(
-        1.02 * x_path, 1.02 * y_path, 1.02 * z_path, color="r", linewidth=3, zorder=10
+        1.02 * x_path, 1.02 * y_path, 1.02 * z_path, color="red", linewidth=3, zorder=10
     )
-    ax.plot(1.02 * x0, 1.02 * y0, 1.02 * z0, "o", zorder=20)
-    ax.plot(1.02 * x_target, 1.02 * y_target, 1.02 * z_target, "o", zorder=20)
+    ax.plot(1.02 * x0, 1.02 * y0, 1.02 * z0, "o", zorder=20, c="blue")
+    ax.plot(1.02 * x_target, 1.02 * y_target, 1.02 * z_target, "o", zorder=20, c="orange")
     ax.set_xlim([-1.1, 1.1])
     ax.set_ylim([-1.1, 1.1])
     ax.set_zlim([-1.1, 1.1])
+    ax.set_aspect("equal")
+    ax = fig.add_subplot(122)
+    ax.plot(xs[:, 0], xs[:, 1], color="red")
+    ax.plot(0, 0, "o", c="blue")
+    ax.plot(*target, "o", c="orange")
+    ax.set_xlim([0, 2 * np.pi])
+    ax.set_ylim([0, 2 * np.pi])
     ax.set_aspect("equal")
     plt.show()
 
