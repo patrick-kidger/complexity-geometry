@@ -239,9 +239,14 @@ def metric_to_christoffel(
     @jax.jit
     def christoffel_second_kind(x: ArrayM) -> ArrayMMM:
         Γ: ArrayMMM = christoffel_first_kind(x)
-        g: ArrayMM = materialised_metric(x)
-        g_inv = jnp.linalg.inv(g)
-        return jnp.tensordot(g_inv, Γ, axes=((1,), (2,)))
+        g = metric(x)
+        if lx.is_diagonal(g):
+            diag: ArrayM = lx.diagonal(g)
+            g_inv: ArrayM = 1 / diag
+            return Γ * g_inv
+        else:
+            g_inv: ArrayMM = jnp.linalg.inv(g)
+            return jnp.tensordot(g_inv, Γ, axes=((1,), (2,)))
 
     return christoffel_second_kind
 
