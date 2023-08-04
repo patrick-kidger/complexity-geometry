@@ -2,15 +2,18 @@ import diffrax as dfx
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import jax.scipy as jsp
 import lineax as lx
 import matplotlib.pyplot as plt
 import numpy as np
+import operator
 import optax
 import optimistix as optx
 from collections.abc import Callable
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, Complex, Float, Int
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-from typing import TypeAlias
+from numpy import ndarray
+from typing import TypeAlias, Union
 
 
 jax.config.update("jax_enable_x64", True)
@@ -29,6 +32,7 @@ def _vector_field(
 ) -> tuple[ArrayM, ArrayM]:
     x, v = y
     dx = v
+    v = eqx.internal.error_if(v, jnp.abs(jnp.max(v)) > 1e4, "oh no")
     dv = -jnp.einsum("IJK,J,K->I", christoffel(x), v, v)
     return dx, dv
 
@@ -39,17 +43,18 @@ def _solve_single_ivp(
     x0: ArrayM,
     v0: ArrayM,
     christoffel: Callable[[ArrayM], ArrayMMM],
+    diffeq_solver: dfx.AbstractSolver,
+    max_steps: None | int,
 ) -> tuple[ArrayM, ArrayM]:
     term = dfx.ODETerm(_vector_field)
-    solver = dfx.Tsit5(scan_kind="lax")  # TODO
     dt0 = None
     y0 = (x0, v0)
     stepsize_controller = dfx.PIDController(
-        rtol=1e-8, atol=1e-8, pcoeff=0.4, icoeff=0.3
+        rtol=1e-6, atol=1e-6, pcoeff=0.3, icoeff=0.4
     )
     sol = dfx.diffeqsolve(
         term,
-        solver,
+        diffeq_solver,
         t0,
         t1,
         dt0,
@@ -57,6 +62,7 @@ def _solve_single_ivp(
         args=christoffel,
         stepsize_controller=stepsize_controller,
         adjoint=dfx.DirectAdjoint(),  # TODO
+        max_steps=max_steps,
     )
     (xs, vs) = sol.ys
     (x1,) = xs
@@ -73,22 +79,29 @@ def _vector_field_with_length(t, y, args):
 
 
 @eqx.filter_jit
-def solve_inference_ivp(v0: ArrayM, metric: Callable[[ArrayM], lx.AbstractLinearOperator], christoffel: Callable[[ArrayM], ArrayMMM]) -> tuple[Float[Array, "100 M"], FloatScalar]:
+def solve_inference_ivp(
+    v0: ArrayM,
+    metric: Callable[[ArrayM], lx.AbstractLinearOperator],
+    christoffel: Callable[[ArrayM], ArrayMMM],
+    diffeq_solver: dfx.AbstractSolver = dfx.Tsit5(),
+    diffeq_max_steps: None | int = 4096,
+) -> tuple[Float[Array, "100 M"], FloatScalar]:
     term = dfx.ODETerm(_vector_field_with_length)
-    solver = dfx.Tsit5()
     t0 = 0
     t1 = 1
     dt0 = None
     y0 = (jnp.zeros_like(v0), v0)
     stepsize_controller = dfx.PIDController(
-        rtol=1e-8, atol=1e-8, pcoeff=0.4, icoeff=0.3
+        rtol=1e-6, atol=1e-6, pcoeff=0.3, icoeff=0.4
     )
-    trajectory_saveat = dfx.SubSaveAt(ts=jnp.linspace(t0, t1, 100), fn=lambda t, y, args: y[0][0])
+    trajectory_saveat = dfx.SubSaveAt(
+        ts=jnp.linspace(t0, t1, 100), fn=lambda t, y, args: y[0][0]
+    )
     length_saveat = dfx.SubSaveAt(t1=True, fn=lambda t, y, args: y[1])
     saveat = dfx.SaveAt(subs=(trajectory_saveat, length_saveat))
     sol = dfx.diffeqsolve(
         term,
-        solver,
+        diffeq_solver,
         t0,
         t1,
         dt0,
@@ -96,7 +109,7 @@ def solve_inference_ivp(v0: ArrayM, metric: Callable[[ArrayM], lx.AbstractLinear
         args=(metric, christoffel),
         stepsize_controller=stepsize_controller,
         saveat=saveat,
-        max_steps=16**5,
+        max_steps=diffeq_max_steps,
     )
     xs, (length,) = sol.ys
     return xs, length
@@ -107,6 +120,8 @@ def _solve_init(
     init_x0: ArrayM,
     tdiff: ArrayM,
     christoffel: Callable[[ArrayM], ArrayMMM],
+    solver: Union[optx.AbstractLeastSquaresSolver, optx.AbstractRootFinder, optx.AbstractMinimiser],
+    max_steps: None | int,
 ) -> ArrayM:
     def _init_root_fn(init_v0: ArrayM, _) -> ArrayM:
         Γ = christoffel(init_x0)
@@ -116,17 +131,24 @@ def _solve_init(
             - init_init_v0
         )
 
-    root_finder = optx.Newton(rtol=1e-4, atol=1e-4)
-    init_sol = optx.least_squares(_init_root_fn, root_finder, init_init_v0)
+    init_sol = optx.least_squares(_init_root_fn, solver, init_init_v0, max_steps=max_steps)
     return init_sol.value
 
 
+# Also a good default:
+# opt_solver = optx.OptaxMinimiser(optax.adabelief, rtol=1e-4, atol=1e-4, learning_rate=1e-2)
 @eqx.filter_jit
 def solve_bvp(
     target: ArrayM,
     pieces: int,
     christoffel: Callable[[ArrayM], ArrayMMM],
-    canonicalise: None | Callable[[ArrayM], ArrayM] = None,
+    canonicalise: Callable[[ArrayM], ArrayM] = lambda x: x,
+    init_solver: Union[optx.AbstractLeastSquaresSolver, optx.AbstractRootFinder, optx.AbstractMinimiser] = optx.Newton(rtol=1e-4, atol=1e-4),
+    diffeq_solver: dfx.AbstractSolver = dfx.Tsit5(scan_kind="lax"),  # TODO
+    opt_solver: Union[optx.AbstractLeastSquaresSolver, optx.AbstractRootFinder, optx.AbstractMinimiser] = optx.Newton(rtol=1e-4, atol=1e-4),
+    init_max_steps: None | int = 256,
+    diffeq_max_steps: None | int = 4096,
+    opt_max_steps: None | int = 256,
 ) -> ArrayM:
     ts = jnp.linspace(0, 1, pieces + 1)
     t0s = ts[:-1]
@@ -175,19 +197,19 @@ def solve_bvp(
     # For efficiency, solve this as a batch-of-root-finding-problems, not just a single
     # big root-finding problem. (Scales as O(BM^3) rather than O((BM)^3).)
     init_v0s = eqx.filter_vmap(_solve_init)(
-        init_init_v0s, init_x0s[:-1], tdiffs, christoffel
+        init_init_v0s, init_x0s[:-1], tdiffs, christoffel, init_solver, init_max_steps
     )
 
-    if canonicalise is not None:
-        target = canonicalise(target)
+    target = canonicalise(target)
 
-    def _root_fn(later_x0s: Float[Array, "pieces-1 M"], v0s: Float[Array, "pieces M"]):  # M * (2 * pieces - 1) inputs
+    def _root_fn(
+        later_x0s: Float[Array, "pieces-1 M"], v0s: Float[Array, "pieces M"]
+    ):  # M * (2 * pieces - 1) inputs
         zero = jnp.zeros((1, M), target.dtype)
         x0s = jnp.concatenate([zero, later_x0s])
-        (x1s, v1s) = eqx.filter_vmap(_solve_single_ivp)(t0s, t1s, x0s, v0s, christoffel)
-        if canonicalise is not None:
-            x0s = jax.vmap(canonicalise)(x0s)
-            x1s = jax.vmap(canonicalise)(x1s)
+        (x1s, v1s) = eqx.filter_vmap(_solve_single_ivp)(t0s, t1s, x0s, v0s, christoffel, diffeq_solver, diffeq_max_steps)
+        x0s = jax.vmap(canonicalise)(x0s)
+        x1s = jax.vmap(canonicalise)(x1s)
         x_diff = x0s[1:] - x1s[:-1]  # M * (pieces - 1) conditions
         v_diff = v0s[1:] - v1s[:-1]  # M * (pieces - 1) conditions
         target_diff = x1s[-1] - target  # M conditions
@@ -196,11 +218,8 @@ def solve_bvp(
     def _lstsq_fn(z, _):
         return _root_fn(*z)
 
-    # TODO
-    # solver = optx.OptaxMinimiser(optax.adabelief, rtol=1e-4, atol=1e-4, learning_rate=1e-2)
-    solver = optx.Newton(rtol=1e-4, atol=1e-4)
     sol = optx.least_squares(
-        _lstsq_fn, solver, (init_later_x0s, init_v0s), max_steps=10000, throw=False
+        _lstsq_fn, opt_solver, (init_later_x0s, init_v0s), max_steps=opt_max_steps, throw=False
     )
     _, v0s = sol.value
     return v0s[0]
@@ -245,19 +264,74 @@ def metric_to_christoffel(
             g_inv: ArrayM = 1 / diag
             return Γ * g_inv
         else:
-            g_inv: ArrayMM = jnp.linalg.inv(g)
-            return jnp.tensordot(g_inv, Γ, axes=((1,), (2,)))
+            g_inv: ArrayMM = jnp.linalg.inv(g.as_matrix())
+            return jnp.tensordot(g_inv, Γ, axes=((1,), (2,)))  # pyright: ignore
 
     return christoffel_second_kind
 
 
+def demo_qubit():
+    N = 1  # number of qubits
+    M = 4**N - 1  # number of real values parameterising SU(2^N)
+
+    # Basis elements: (for N>1, tensor products of) Pauli matrices
+    σ0: Complex[ndarray, "2*N 2*N"] = np.array([[0, 1], [1, 0.0 + 0j]])
+    σ1: Complex[ndarray, "2*N 2*N"] = np.array([[0, -1j], [1j, 0]])  # pyright: ignore
+    σ2: Complex[ndarray, "2*N 2*N"] = np.array([[1, 0], [0, -1.0 + 0j]])
+    σ_vec: Complex[ndarray, "M 2*N 2*N"] = np.stack([σ0, σ1, σ2])
+    assert σ_vec.shape == (M, 2 * N, 2 * N)
+
+    # Products of basis elements
+    bbmm = jax.vmap(jax.vmap(operator.matmul, in_axes=(None, 0)), in_axes=(0, None))
+    σ_prod: Complex[Array, "M M 2*N 2*N"] = bbmm(σ_vec, σ_vec)  # σ_prod[i,j]=σ_i@σ_j
+    assert σ_prod.shape == (M, M, 2 * N, 2 * N)
+
+    # Moments of inertia
+    I_diag: Float[Array, " M"] = jnp.array([0.1, 0.1, 1.0])
+    assert I_diag.shape == (M,)
+
+    # Trace[A^H B], normalised s.t. Trace[Id] = 1
+    def inner_product(A: Complex[Array, "2*N 2*N"], B: Complex[Array, "2*N 2*N"]) -> Complex[Array, ""]:
+        return jnp.sum(A.conj().T * B) / (2 * N)
+
+    # The metric g_ij(x) for fixed i,j,x.
+    def metric_element(
+        σ_prod1: Complex[Array, "M 2*N 2*N"],  # σ_k @ σ_i with varying k and fixed i
+        σ_prod2: Complex[Array, "M 2*N 2*N"],  # σ_k @ σ_j with varying k and fixed j
+        x: Float[Array, " M"],
+    ) -> Float[Array, ""]:
+        U: Complex[Array, "2*N 2*N"] = jsp.linalg.expm(jnp.einsum("a,abc->bc", 1j * x, σ_vec))
+        batch_inner_product = jax.vmap(inner_product, in_axes=(None, 0))
+        left: Complex[Array, "M"] = batch_inner_product(U, σ_prod1)
+        right: Complex[Array, "M"] = batch_inner_product(U, σ_prod2)
+        return jnp.einsum("i,i,i->", I_diag, left, right).real
+
+    # The metric at a particular set of intrinsic coordinates x.
+    def metric(x: Float[Array, " M"]) -> lx.AbstractLinearOperator:
+        bb_metric_element = jax.vmap(
+            jax.vmap(metric_element, in_axes=(None, 1, None)), in_axes=(1, None, None)
+        )
+        matrix: Float[Array, "M M"] = bb_metric_element(σ_prod, σ_prod, x)
+        return lx.MatrixLinearOperator(matrix)
+
+    christoffel = metric_to_christoffel(metric)
+
+    def canonicalise(x: Float[Array, " M"]):
+        return x % (2 * np.pi)
+
+    for t in np.linspace(1, 6, 10):
+        target = np.array([0.4387, 0.3816, 0]) * t
+        pieces = 40
+        init_solver = optx.OptaxMinimiser(optax.adabelief, rtol=1e-4, atol=1e-4, learning_rate=1e-2)
+        diffeq_solver = dfx.Tsit5()
+        opt_solver = optx.OptaxMinimiser(optax.adabelief, rtol=1e-4, atol=1e-4, learning_rate=1e-3)
+        v0 = solve_bvp(target, pieces, christoffel, canonicalise, init_solver=init_solver, diffeq_solver=diffeq_solver, opt_solver=opt_solver)
+        xs, length = solve_inference_ivp(v0, metric, christoffel, diffeq_max_steps=16**5)
+        print(f"{t=:.3f}, length={length.item():.3f}")
+
+
 # Source: https://www.cefns.nau.edu/~schulz/torus.pdf
 def demo_torus():
-    θ_target = 1
-    φ_target = 2.2
-    target = jnp.array([θ_target, φ_target])
-    pieces = 4  # TODO: increasing this doesn't seem to help?
-
     R = 1
     r = 0.2
 
@@ -298,9 +372,11 @@ def demo_torus():
         assert x.shape == (2,)
         return x % (2 * jnp.pi)
 
-    v0 = solve_bvp(
-        target, pieces, christoffel, canonicalise
-    )
+    θ_target = 1
+    φ_target = 2.2
+    target = jnp.array([θ_target, φ_target])
+    pieces = 4  # TODO: increasing this doesn't seem to help?
+    v0 = solve_bvp(target, pieces, christoffel, canonicalise)
     xs, length = solve_inference_ivp(v0, metric, christoffel)
     print(f"length={length.item():.3f}")
     x_path, y_path, z_path = jax.vmap(manifold, out_axes=1)(xs)
@@ -308,7 +384,9 @@ def demo_torus():
     x_target, y_target, z_target = manifold(target)
 
     surface = np.mgrid[0.0 : 2 * np.pi : 100j, 0.0 : 2 * np.pi : 100j]
-    x_surface, y_surface, z_surface = jax.vmap(jax.vmap(manifold, in_axes=1, out_axes=1), in_axes=1, out_axes=1)(surface)
+    x_surface, y_surface, z_surface = jax.vmap(
+        jax.vmap(manifold, in_axes=1, out_axes=1), in_axes=1, out_axes=1
+    )(surface)  # pyright: ignore
     fig = plt.figure()
     ax = fig.add_subplot(121, projection="3d")
     ax.plot_surface(
@@ -318,7 +396,9 @@ def demo_torus():
         1.02 * x_path, 1.02 * y_path, 1.02 * z_path, color="red", linewidth=3, zorder=10
     )
     ax.plot(1.02 * x0, 1.02 * y0, 1.02 * z0, "o", zorder=20, c="blue")
-    ax.plot(1.02 * x_target, 1.02 * y_target, 1.02 * z_target, "o", zorder=20, c="orange")
+    ax.plot(
+        1.02 * x_target, 1.02 * y_target, 1.02 * z_target, "o", zorder=20, c="orange"
+    )
     ax.set_xlim([-1.1, 1.1])
     ax.set_ylim([-1.1, 1.1])
     ax.set_zlim([-1.1, 1.1])
@@ -334,4 +414,10 @@ def demo_torus():
 
 
 if __name__ == "__main__":
-    demo_torus()
+    # demo_torus()
+    demo_qubit()
+
+
+# TODO:
+# - Failing to integrate the final single shooting piece -- why?
+# - Te initial z-component is flip-flopping back and forth at init. Why?
