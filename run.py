@@ -10,7 +10,7 @@ import operator
 import optax
 import optimistix as optx
 from collections.abc import Callable
-from jaxtyping import Array, Complex, Float, Int
+from jaxtyping import Array, ArrayLike, Complex, Float, Int, PyTree
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from numpy import ndarray
 from typing import Optional, TypeAlias, Union
@@ -43,7 +43,7 @@ def _solve_single_ivp(
     x0: ArrayM,
     v0: ArrayM,
     christoffel: Callable[[ArrayM], ArrayMMM],
-    diffeq_solver: dfx.AbstractSolver,
+    solver: dfx.AbstractSolver,
     adjoint: dfx.AbstractAdjoint,
     max_steps: None | int,
 ) -> tuple[ArrayM, ArrayM]:
@@ -55,7 +55,7 @@ def _solve_single_ivp(
     )
     sol = dfx.diffeqsolve(
         term,
-        diffeq_solver,
+        solver,
         t0,
         t1,
         dt0,
@@ -84,25 +84,21 @@ def solve_inference_ivp(
     v0: ArrayM,
     metric: Callable[[ArrayM], lx.AbstractLinearOperator],
     christoffel: Callable[[ArrayM], ArrayMMM],
-    diffeq_solver: dfx.AbstractSolver = dfx.Tsit5(),
-    diffeq_max_steps: None | int = 4096,
-) -> tuple[Float[Array, "100 M"], FloatScalar, IntScalar]:
+    saveat: dfx.SaveAt,
+    t1: Float[ArrayLike, ""] = 1,
+    solver: dfx.AbstractSolver = dfx.Tsit5(),
+    max_steps: None | int = 4096,
+) -> tuple[PyTree[Array], IntScalar]:
     term = dfx.ODETerm(_vector_field_with_length)
     t0 = 0
-    t1 = 1
     dt0 = None
     y0 = (jnp.zeros_like(v0), v0)
     stepsize_controller = dfx.PIDController(
         rtol=1e-10, atol=1e-10, pcoeff=0.3, icoeff=0.4
     )
-    trajectory_saveat = dfx.SubSaveAt(
-        ts=jnp.linspace(t0, t1, 100), fn=lambda t, y, args: y[0][0]
-    )
-    length_saveat = dfx.SubSaveAt(t1=True, fn=lambda t, y, args: y[1])
-    saveat = dfx.SaveAt(subs=(trajectory_saveat, length_saveat))
     sol = dfx.diffeqsolve(
         term,
-        diffeq_solver,
+        solver,
         t0,
         t1,
         dt0,
@@ -110,11 +106,9 @@ def solve_inference_ivp(
         args=(metric, christoffel),
         stepsize_controller=stepsize_controller,
         saveat=saveat,
-        max_steps=diffeq_max_steps,
+        max_steps=max_steps,
     )
-    xs, (length,) = sol.ys
-    return xs, length, sol.stats["num_steps"]
-
+    return sol.ys, sol.stats["num_steps"]
 
 def _solve_init(
     init_init_v0: ArrayM,
@@ -144,6 +138,7 @@ def solve_bvp(
     pieces: int,
     christoffel: Callable[[ArrayM], ArrayMMM],
     bounds: Optional[ArrayM] = None,
+    init_init_v0s: Optional[Float[Array, "pieces M"]] = None,  # pyright: ignore
     init_solver: Union[None, optx.AbstractLeastSquaresSolver, optx.AbstractRootFinder, optx.AbstractMinimiser] = optx.Newton(rtol=1e-4, atol=1e-4),
     diffeq_solver: dfx.AbstractSolver = dfx.Tsit5(),
     opt_solver: Union[optx.AbstractLeastSquaresSolver, optx.AbstractRootFinder, optx.AbstractMinimiser] = optx.Newton(rtol=1e-4, atol=1e-4),
@@ -151,7 +146,7 @@ def solve_bvp(
     init_max_steps: None | int = 256,
     diffeq_max_steps: None | int = 4096,
     opt_max_steps: None | int = 256,
-) -> ArrayM:
+) -> tuple[ArrayM, IntScalar]:
     if bounds is not None:
         # We always start our diffeq at zero, so put the cut on the opposite side.
         offset = jnp.where(jnp.isinf(bounds), 0, (bounds / 2))
@@ -165,7 +160,9 @@ def solve_bvp(
     )(target)
     init_later_x0s: Float[Array, "pieces-1 M"] = init_x0s[1:-1]
     if init_solver is None:
-        init_v0s: Float[Array, "pieces M"] = jnp.zeros((pieces, M), target.dtype)
+        if init_init_v0s is None:
+            init_init_v0s: Float[Array, "pieces M"]  = jnp.zeros((pieces, M), target.dtype)
+        init_v0s: Float[Array, "pieces M"] = init_init_v0s
     else:
         # For our multiple-shooting solve, we need to initialise both positions and
         # velocity at each of our boundary points.
@@ -203,7 +200,8 @@ def solve_bvp(
         # Then returning to our overall problem: use *that* to initialise our multiple
         # shooting algorithm!
         tdiffs: Float[Array, "pieces 1"] = (t1s - t0s)[:, jnp.newaxis]
-        init_init_v0s: Float[Array, "pieces M"] = (init_x0s[1:] - init_x0s[:-1]) / tdiffs
+        if init_init_v0s is None:
+            init_init_v0s: Float[Array, "pieces M"] = (init_x0s[1:] - init_x0s[:-1]) / tdiffs
         # For efficiency, solve this as a batch-of-root-finding-problems, not just a single
         # big root-finding problem. (Scales as O(BM^3) rather than O((BM)^3).)
         init_v0s = eqx.filter_vmap(_solve_init)(
@@ -224,10 +222,10 @@ def solve_bvp(
         return x_diff, v_diff, target_diff  # M * (2 * pieces - 1) outputs
 
     sol = optx.root_find(
-        _root_fn, opt_solver, (init_later_x0s, init_v0s), max_steps=opt_max_steps, throw=False
+        _root_fn, opt_solver, (init_later_x0s, init_v0s), max_steps=opt_max_steps
     )
     _, v0s = sol.value
-    return v0s[0]
+    return v0s[0], sol.stats["num_steps"]
 
 
 # Source: https://www.geometrictools.com/Documentation/RiemannianGeodesics.pdf
@@ -335,23 +333,40 @@ def demo_qubit():
     christoffel = metric_to_christoffel(metric)
 
     bounds = jnp.array([2 * np.pi, 2 * np.pi, 2 * np.pi])
-
-    for t in np.linspace(0, 2, 21):
-        target = jnp.array([0.4387, 0.3816, 0]) * t
-        pieces = 4
-        init_solver = None
-        optim = optax.chain(
-            optax.adabelief(1e-2),
-            optax.scale_by_schedule(
-                optax.piecewise_constant_schedule(1, {500: 0.1, 1000: 0.1})
-            )
+    pieces = 4
+    init_v0s = jnp.zeros((pieces, M))  # Used on the i=0 and i=1 iterations.
+    init_solver = None
+    optim = optax.chain(
+        optax.adam(1e-3),
+        optax.scale_by_schedule(
+            optax.piecewise_constant_schedule(1, {200: 0.1})
         )
-        opt_solver = optx.OptaxMinimiser(lambda: optim, rtol=1e-4, atol=1e-4)
-        v0 = solve_bvp(target, pieces, christoffel, bounds, init_solver=init_solver, opt_solver=opt_solver, opt_max_steps=2000)
-        xs, length, num_steps = solve_inference_ivp(v0, metric, christoffel, diffeq_max_steps=16**5)
-        error = (xs[-1] - target).tolist()
+    )
+    opt_solver = optx.OptaxMinimiser(lambda: optim, rtol=1e-4, atol=1e-4)
+
+    ts = np.linspace(0, 2, 21)
+
+    for i in range(len(ts)):
+        t = ts[i]
+        next_t = ts[min(i + 1, len(ts) - 1)]
+        target = jnp.array([0.4387, 0.3816, 0]) * t
+        v0, optim_num_steps = solve_bvp(target, pieces, christoffel, bounds, init_init_v0s=init_v0s, init_solver=init_solver, opt_solver=opt_solver, opt_max_steps=5000)
+
+        if t == 0:
+            next_t1 = jnp.array(1.0)
+        else:
+            next_t1 = next_t / t
+        x1_saveat = dfx.SubSaveAt(ts=jnp.array([1.0]), fn=lambda t, y, args: y[0][0])
+        vs_saveat = dfx.SubSaveAt(ts=jnp.linspace(0, next_t1, pieces + 1)[:-1], fn=lambda t, y, args: y[0][1])
+        length_saveat = dfx.SubSaveAt(ts=jnp.array([1.0]), fn=lambda t, y, args: y[1])
+        saveat = dfx.SaveAt(subs=(x1_saveat, vs_saveat, length_saveat))
+        ((x1,), _init_v0s, (length,)), diffeq_num_steps = solve_inference_ivp(v0, metric, christoffel, t1=next_t1, saveat=saveat, max_steps=16**5)
+        if t != 0:
+            init_v0s = _init_v0s
+            
+        error = (x1 - target).tolist()
         error_string = "[" + ", ".join(f"{x:.5f}" for x in error) + "]"
-        print(f"{t=:.3f}, length={length.item():.3f} error={error_string} num_steps={num_steps.item()}")
+        print(f"{t=:.3f}, length={length.item():.3f} error={error_string} optim_num_steps={optim_num_steps.item()} diffeq_num_steps={diffeq_num_steps.item()}")
 
 
 # Source: https://www.cefns.nau.edu/~schulz/torus.pdf
@@ -398,8 +413,12 @@ def demo_torus():
     φ_target = 2.2
     target = jnp.array([θ_target, φ_target])
     pieces = 4
-    v0 = solve_bvp(target, pieces, christoffel, bounds, diffeq_solver=dfx.Tsit5(scan_kind="lax"), diffeq_adjoint=dfx.DirectAdjoint())
-    xs, length, _ = solve_inference_ivp(v0, metric, christoffel)
+    v0, _ = solve_bvp(target, pieces, christoffel, bounds, diffeq_solver=dfx.Tsit5(scan_kind="lax"), diffeq_adjoint=dfx.DirectAdjoint())
+
+    xs_saveat = dfx.SubSaveAt(ts=jnp.linspace(0, 1, 100), fn=lambda t, y, args: y[0][0])
+    length_saveat = dfx.SubSaveAt(t1=True, fn=lambda t, y, args: y[1])
+    saveat = dfx.SaveAt(subs=(xs_saveat, length_saveat))
+    (xs, (length,)), _ = solve_inference_ivp(v0, metric, christoffel, saveat=saveat)
     print(f"length={length.item():.3f}")
     x_path, y_path, z_path = jax.vmap(manifold, out_axes=1)(xs)
     x0, y0, z0 = manifold(jnp.zeros_like(target))
