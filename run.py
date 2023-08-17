@@ -13,7 +13,7 @@ from collections.abc import Callable
 from jaxtyping import Array, Complex, Float, Int
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from numpy import ndarray
-from typing import TypeAlias, Union
+from typing import Optional, TypeAlias, Union
 
 
 jax.config.update("jax_enable_x64", True)
@@ -21,6 +21,7 @@ jax.config.update("jax_enable_x64", True)
 
 # M = 4^N - 1 for a system of N qubits.
 FloatScalar: TypeAlias = Float[Array, ""]
+IntScalar: TypeAlias = Int[Array, ""]
 Array1D: TypeAlias = Float[Array, " _"]
 ArrayM: TypeAlias = Float[Array, " M"]
 ArrayMM: TypeAlias = Float[Array, "M M"]
@@ -32,7 +33,6 @@ def _vector_field(
 ) -> tuple[ArrayM, ArrayM]:
     x, v = y
     dx = v
-    v = eqx.internal.error_if(v, jnp.abs(jnp.max(v)) > 1e4, "oh no")
     dv = -jnp.einsum("IJK,J,K->I", christoffel(x), v, v)
     return dx, dv
 
@@ -44,6 +44,7 @@ def _solve_single_ivp(
     v0: ArrayM,
     christoffel: Callable[[ArrayM], ArrayMMM],
     diffeq_solver: dfx.AbstractSolver,
+    adjoint: dfx.AbstractAdjoint,
     max_steps: None | int,
 ) -> tuple[ArrayM, ArrayM]:
     term = dfx.ODETerm(_vector_field)
@@ -61,7 +62,7 @@ def _solve_single_ivp(
         y0,
         args=christoffel,
         stepsize_controller=stepsize_controller,
-        adjoint=dfx.DirectAdjoint(),  # TODO
+        adjoint=adjoint,
         max_steps=max_steps,
     )
     (xs, vs) = sol.ys
@@ -85,14 +86,14 @@ def solve_inference_ivp(
     christoffel: Callable[[ArrayM], ArrayMMM],
     diffeq_solver: dfx.AbstractSolver = dfx.Tsit5(),
     diffeq_max_steps: None | int = 4096,
-) -> tuple[Float[Array, "100 M"], FloatScalar]:
+) -> tuple[Float[Array, "100 M"], FloatScalar, IntScalar]:
     term = dfx.ODETerm(_vector_field_with_length)
     t0 = 0
     t1 = 1
     dt0 = None
     y0 = (jnp.zeros_like(v0), v0)
     stepsize_controller = dfx.PIDController(
-        rtol=1e-6, atol=1e-6, pcoeff=0.3, icoeff=0.4
+        rtol=1e-10, atol=1e-10, pcoeff=0.3, icoeff=0.4
     )
     trajectory_saveat = dfx.SubSaveAt(
         ts=jnp.linspace(t0, t1, 100), fn=lambda t, y, args: y[0][0]
@@ -112,7 +113,7 @@ def solve_inference_ivp(
         max_steps=diffeq_max_steps,
     )
     xs, (length,) = sol.ys
-    return xs, length
+    return xs, length, sol.stats["num_steps"]
 
 
 def _solve_init(
@@ -131,7 +132,7 @@ def _solve_init(
             - init_init_v0
         )
 
-    init_sol = optx.least_squares(_init_root_fn, solver, init_init_v0, max_steps=max_steps)
+    init_sol = optx.root_find(_init_root_fn, solver, init_init_v0, max_steps=max_steps)
     return init_sol.value
 
 
@@ -142,14 +143,19 @@ def solve_bvp(
     target: ArrayM,
     pieces: int,
     christoffel: Callable[[ArrayM], ArrayMMM],
-    canonicalise: Callable[[ArrayM], ArrayM] = lambda x: x,
-    init_solver: Union[optx.AbstractLeastSquaresSolver, optx.AbstractRootFinder, optx.AbstractMinimiser] = optx.Newton(rtol=1e-4, atol=1e-4),
-    diffeq_solver: dfx.AbstractSolver = dfx.Tsit5(scan_kind="lax"),  # TODO
+    bounds: Optional[ArrayM] = None,
+    init_solver: Union[None, optx.AbstractLeastSquaresSolver, optx.AbstractRootFinder, optx.AbstractMinimiser] = optx.Newton(rtol=1e-4, atol=1e-4),
+    diffeq_solver: dfx.AbstractSolver = dfx.Tsit5(),
     opt_solver: Union[optx.AbstractLeastSquaresSolver, optx.AbstractRootFinder, optx.AbstractMinimiser] = optx.Newton(rtol=1e-4, atol=1e-4),
+    diffeq_adjoint: dfx.AbstractAdjoint = dfx.RecursiveCheckpointAdjoint(),
     init_max_steps: None | int = 256,
     diffeq_max_steps: None | int = 4096,
     opt_max_steps: None | int = 256,
 ) -> ArrayM:
+    if bounds is not None:
+        # We always start our diffeq at zero, so put the cut on the opposite side.
+        offset = jnp.where(jnp.isinf(bounds), 0, (bounds / 2))
+        target = ((target + offset) % bounds) - offset
     ts = jnp.linspace(0, 1, pieces + 1)
     t0s = ts[:-1]
     t1s = ts[1:]
@@ -158,68 +164,67 @@ def solve_bvp(
         lambda x: jnp.linspace(0, x, pieces + 1, dtype=target.dtype), out_axes=1
     )(target)
     init_later_x0s: Float[Array, "pieces-1 M"] = init_x0s[1:-1]
-    # For our multiple-shooting solve, we need to initialise both positions and
-    # velocity at each of our boundary points.
-    # We initialise positions as above: linearly interpolate in the space of intrinsic
-    # coordinates.
-    # Now to initialise velocities. We want these to approximately solve the shooting
-    # problem over each interval, so that we take as few iterative steps as possible.
-    #
-    # Considering a single shooting interval, make a one-step Euler approximation over
-    # the whole interval (here, `i` denote indexing over channels, and we elide the
-    # indexing over intervals):
-    #
-    # x1_i = x0_i + \int_t0^t1 v_i(t) dt
-    #      = x0_i + \int_t0^t1 v_i(t0) + \int_t0^t Γ^i_jk(s) v_j(s) v_k(s) ds dt
-    #      ~ x0_i + \int_t0^t1 v_i(t0) + \int_t0^t Γ^i_jk(t0) v_j(t0) v_k(t0) ds dt
-    #      = x0_i + \int_t0^t1 v_i(t0) + (t - t0) Γ^i_jk(t0) v_j(t0) v_k(t0) dt
-    #      = x0_i + (t1 - t0) v_i(t0) + 0.5 (t1 - t0)^2 Γ^i_jk(t0) v_j(t0) v_k(t0)
-    #                                                                                [A]
-    # We see that an estimate of v(t0) is given by solving this multivariate
-    # quadratric system. (Of the form 0 = A_ijk y_j y_k + B_ij y_j + c_i.)
-    #
-    # Now this is a difficult in general (unlike the linear case! i.e. A=0). See:
-    #   https://mathoverflow.net/questions/153436/can-you-efficiently-solve-a-system-of-quadratic-multivariate-polynomials
-    #   https://arxiv.org/abs/cs/0403008
-    #   https://hal.science/hal-01567408/document
-    #
-    # So, the answer is to solve this in turn as a root-finding problem.
-    #
-    # Now we note that our Γ is often sparse/small. So to solve this root-finding
-    # problem in turn, we start off our iteration with v(t0) = (x1 - x0)/(t1 - t0).
-    # (Recall that we are still considering just a single shooting interval.). Then
-    # run a root-finding algorithm wrt [A] over every interal.
-    #
-    # Then returning to our overall problem: use *that* to initialise our multiple
-    # shooting algorithm!
-    tdiffs: Float[Array, "pieces 1"] = (t1s - t0s)[:, jnp.newaxis]
-    init_init_v0s: Float[Array, "pieces M"] = (init_x0s[1:] - init_x0s[:-1]) / tdiffs
-    # For efficiency, solve this as a batch-of-root-finding-problems, not just a single
-    # big root-finding problem. (Scales as O(BM^3) rather than O((BM)^3).)
-    init_v0s = eqx.filter_vmap(_solve_init)(
-        init_init_v0s, init_x0s[:-1], tdiffs, christoffel, init_solver, init_max_steps
-    )
+    if init_solver is None:
+        init_v0s: Float[Array, "pieces M"] = jnp.zeros((pieces, M), target.dtype)
+    else:
+        # For our multiple-shooting solve, we need to initialise both positions and
+        # velocity at each of our boundary points.
+        # We initialise positions as above: linearly interpolate in the space of
+        # intrinsic coordinates.
+        # Now to initialise velocities. We want these to approximately solve the
+        # shooting problem over each interval, so that we take as few iterative steps as
+        # possible.
+        #
+        # Considering a single shooting interval, make a one-step Euler approximation
+        # over the whole interval (here, `i` denote indexing over channels, and we elide
+        # the indexing over intervals):
+        #
+        # x1_i = x0_i + \int_t0^t1 v_i(t) dt
+        #      = x0_i + \int_t0^t1 v_i(t0) + \int_t0^t Γ^i_jk(s) v_j(s) v_k(s) ds dt
+        #      ~ x0_i + \int_t0^t1 v_i(t0) + \int_t0^t Γ^i_jk(t0) v_j(t0) v_k(t0) ds dt
+        #      = x0_i + \int_t0^t1 v_i(t0) + (t - t0) Γ^i_jk(t0) v_j(t0) v_k(t0) dt
+        #      = x0_i + (t1 - t0) v_i(t0) + 0.5 (t1 - t0)^2 Γ^i_jk(t0) v_j(t0) v_k(t0)
+        #                                                                            [A]
+        # We see that an estimate of v(t0) is given by solving this multivariate
+        # quadratric system. (Of the form 0 = A_ijk y_j y_k + B_ij y_j + c_i.)
+        #
+        # Now this is a difficult in general (unlike the linear case! i.e. A=0). See:
+        #   https://mathoverflow.net/questions/153436/can-you-efficiently-solve-a-system-of-quadratic-multivariate-polynomials
+        #   https://arxiv.org/abs/cs/0403008
+        #   https://hal.science/hal-01567408/document
+        #
+        # So, the answer is to solve this in turn as a root-finding problem.
+        #
+        # Now we note that our Γ is often sparse/small. So to solve this root-finding
+        # problem in turn, we start off our iteration with v(t0) = (x1 - x0)/(t1 - t0).
+        # (Recall that we are still considering just a single shooting interval.). Then
+        # run a root-finding algorithm wrt [A] over every interal.
+        #
+        # Then returning to our overall problem: use *that* to initialise our multiple
+        # shooting algorithm!
+        tdiffs: Float[Array, "pieces 1"] = (t1s - t0s)[:, jnp.newaxis]
+        init_init_v0s: Float[Array, "pieces M"] = (init_x0s[1:] - init_x0s[:-1]) / tdiffs
+        # For efficiency, solve this as a batch-of-root-finding-problems, not just a single
+        # big root-finding problem. (Scales as O(BM^3) rather than O((BM)^3).)
+        init_v0s = eqx.filter_vmap(_solve_init)(
+            init_init_v0s, init_x0s[:-1], tdiffs, christoffel, init_solver, init_max_steps
+        )
 
-    target = canonicalise(target)
-
-    def _root_fn(
-        later_x0s: Float[Array, "pieces-1 M"], v0s: Float[Array, "pieces M"]
-    ):  # M * (2 * pieces - 1) inputs
+    def _root_fn(inputs, _):
+        later_x0s, v0s = inputs  # M * (2 * pieces - 1) inputs
+        later_x0s: Float[Array, "pieces-1 M"]
+        v0s: Float[Array, "pieces M"]
         zero = jnp.zeros((1, M), target.dtype)
         x0s = jnp.concatenate([zero, later_x0s])
-        (x1s, v1s) = eqx.filter_vmap(_solve_single_ivp)(t0s, t1s, x0s, v0s, christoffel, diffeq_solver, diffeq_max_steps)
-        x0s = jax.vmap(canonicalise)(x0s)
-        x1s = jax.vmap(canonicalise)(x1s)
+        (x1s, v1s) = eqx.filter_vmap(_solve_single_ivp)(t0s, t1s, x0s, v0s, christoffel, diffeq_solver, diffeq_adjoint, diffeq_max_steps)
+        # TODO: figure out bounds
         x_diff = x0s[1:] - x1s[:-1]  # M * (pieces - 1) conditions
         v_diff = v0s[1:] - v1s[:-1]  # M * (pieces - 1) conditions
         target_diff = x1s[-1] - target  # M conditions
         return x_diff, v_diff, target_diff  # M * (2 * pieces - 1) outputs
 
-    def _lstsq_fn(z, _):
-        return _root_fn(*z)
-
-    sol = optx.least_squares(
-        _lstsq_fn, opt_solver, (init_later_x0s, init_v0s), max_steps=opt_max_steps, throw=False
+    sol = optx.root_find(
+        _root_fn, opt_solver, (init_later_x0s, init_v0s), max_steps=opt_max_steps, throw=False
     )
     _, v0s = sol.value
     return v0s[0]
@@ -292,42 +297,61 @@ def demo_qubit():
 
     # Trace[A^H B], normalised s.t. Trace[Id] = 1
     def inner_product(A: Complex[Array, "2*N 2*N"], B: Complex[Array, "2*N 2*N"]) -> Complex[Array, ""]:
-        return jnp.sum(A.conj().T * B) / (2 * N)
-
-    # The metric g_ij(x) for fixed i,j,x.
-    def metric_element(
-        σ_prod1: Complex[Array, "M 2*N 2*N"],  # σ_k @ σ_i with varying k and fixed i
-        σ_prod2: Complex[Array, "M 2*N 2*N"],  # σ_k @ σ_j with varying k and fixed j
-        x: Float[Array, " M"],
-    ) -> Float[Array, ""]:
-        U: Complex[Array, "2*N 2*N"] = jsp.linalg.expm(jnp.einsum("a,abc->bc", 1j * x, σ_vec))
-        batch_inner_product = jax.vmap(inner_product, in_axes=(None, 0))
-        left: Complex[Array, "M"] = batch_inner_product(U, σ_prod1)
-        right: Complex[Array, "M"] = batch_inner_product(U, σ_prod2)
-        return jnp.einsum("i,i,i->", I_diag, left, right).real
+        return jnp.sum(A.conj() * B) / (2 * N)
 
     # The metric at a particular set of intrinsic coordinates x.
     def metric(x: Float[Array, " M"]) -> lx.AbstractLinearOperator:
-        bb_metric_element = jax.vmap(
-            jax.vmap(metric_element, in_axes=(None, 1, None)), in_axes=(1, None, None)
-        )
-        matrix: Float[Array, "M M"] = bb_metric_element(σ_prod, σ_prod, x)
-        return lx.MatrixLinearOperator(matrix)
+        U: Complex[Array, "2*N 2*N"] = jsp.linalg.expm(jnp.einsum("a,abc->bc", 1j * x, σ_vec))
+        bb_inner_product = jax.vmap(jax.vmap(inner_product, in_axes=(None, 0)), in_axes=(None, 0))
+        traces: Complex[Array, "M M"] = bb_inner_product(U, σ_prod)
+        matrix: Complex[Array, "M M"] = jnp.einsum("i,ik,im->km", I_diag, traces, traces)
+        return lx.MatrixLinearOperator(matrix.real)
+
+    # For debugging purposes (with N=1).
+    # def metric_manual(x: Float[Array, " M"]) -> lx.AbstractLinearOperator:
+    #     U = jsp.linalg.expm(1j * (x[0] * σ0 + x[1] * σ1 + x[2] * σ2))
+    #     a00 = jnp.trace(-σ0 @ U.conj().T @ σ0) / 2
+    #     a01 = jnp.trace(-σ1 @ U.conj().T @ σ0) / 2
+    #     a02 = jnp.trace(-σ2 @ U.conj().T @ σ0) / 2
+    #     a10 = jnp.trace(-σ0 @ U.conj().T @ σ1) / 2
+    #     a11 = jnp.trace(-σ1 @ U.conj().T @ σ1) / 2
+    #     a12 = jnp.trace(-σ2 @ U.conj().T @ σ1) / 2
+    #     a20 = jnp.trace(-σ0 @ U.conj().T @ σ2) / 2
+    #     a21 = jnp.trace(-σ1 @ U.conj().T @ σ2) / 2
+    #     a22 = jnp.trace(-σ2 @ U.conj().T @ σ2) / 2
+    #     I0, I1, I2 = I_diag
+    #     g00 = I0 * a00*a00 + I1 * a10*a10 + I2 * a20*a20
+    #     g01 = I0 * a00*a01 + I1 * a10*a11 + I2 * a20*a21
+    #     g02 = I0 * a00*a02 + I1 * a10*a12 + I2 * a20*a22
+    #     g10 = I0 * a01*a00 + I1 * a11*a10 + I2 * a21*a20
+    #     g11 = I0 * a01*a01 + I1 * a11*a11 + I2 * a21*a21
+    #     g12 = I0 * a01*a02 + I1 * a11*a12 + I2 * a21*a22
+    #     g20 = I0 * a02*a00 + I1 * a12*a10 + I2 * a22*a20
+    #     g21 = I0 * a02*a01 + I1 * a12*a11 + I2 * a22*a21
+    #     g22 = I0 * a02*a02 + I1 * a12*a12 + I2 * a22*a22
+    #     matrix = jnp.array([[g00, g01, g02], [g10, g11, g12], [g20, g21, g22]]).real
+    #     return lx.MatrixLinearOperator(matrix)
 
     christoffel = metric_to_christoffel(metric)
 
-    def canonicalise(x: Float[Array, " M"]):
-        return x % (2 * np.pi)
+    bounds = jnp.array([2 * np.pi, 2 * np.pi, 2 * np.pi])
 
-    for t in np.linspace(1, 6, 10):
-        target = np.array([0.4387, 0.3816, 0]) * t
-        pieces = 40
-        init_solver = optx.OptaxMinimiser(optax.adabelief, rtol=1e-4, atol=1e-4, learning_rate=1e-2)
-        diffeq_solver = dfx.Tsit5()
-        opt_solver = optx.OptaxMinimiser(optax.adabelief, rtol=1e-4, atol=1e-4, learning_rate=1e-3)
-        v0 = solve_bvp(target, pieces, christoffel, canonicalise, init_solver=init_solver, diffeq_solver=diffeq_solver, opt_solver=opt_solver)
-        xs, length = solve_inference_ivp(v0, metric, christoffel, diffeq_max_steps=16**5)
-        print(f"{t=:.3f}, length={length.item():.3f}")
+    for t in np.linspace(0, 2, 21):
+        target = jnp.array([0.4387, 0.3816, 0]) * t
+        pieces = 4
+        init_solver = None
+        optim = optax.chain(
+            optax.adabelief(1e-2),
+            optax.scale_by_schedule(
+                optax.piecewise_constant_schedule(1, {500: 0.1, 1000: 0.1})
+            )
+        )
+        opt_solver = optx.OptaxMinimiser(lambda: optim, rtol=1e-4, atol=1e-4)
+        v0 = solve_bvp(target, pieces, christoffel, bounds, init_solver=init_solver, opt_solver=opt_solver, opt_max_steps=2000)
+        xs, length, num_steps = solve_inference_ivp(v0, metric, christoffel, diffeq_max_steps=16**5)
+        error = (xs[-1] - target).tolist()
+        error_string = "[" + ", ".join(f"{x:.5f}" for x in error) + "]"
+        print(f"{t=:.3f}, length={length.item():.3f} error={error_string} num_steps={num_steps.item()}")
 
 
 # Source: https://www.cefns.nau.edu/~schulz/torus.pdf
@@ -368,16 +392,14 @@ def demo_torus():
             [[[Γ⁀θ_θθ, Γ⁀θ_θφ], [Γ⁀θ_φθ, Γ⁀θ_φφ]], [[Γ⁀φ_θθ, Γ⁀φ_θφ], [Γ⁀φ_φθ, Γ⁀φ_φφ]]]
         )
 
-    def canonicalise(x: Float[Array, "2"]) -> Float[Array, "2"]:
-        assert x.shape == (2,)
-        return x % (2 * jnp.pi)
+    bounds = jnp.array([2 * np.pi, 2 * np.pi])
 
     θ_target = 1
     φ_target = 2.2
     target = jnp.array([θ_target, φ_target])
-    pieces = 4  # TODO: increasing this doesn't seem to help?
-    v0 = solve_bvp(target, pieces, christoffel, canonicalise)
-    xs, length = solve_inference_ivp(v0, metric, christoffel)
+    pieces = 4
+    v0 = solve_bvp(target, pieces, christoffel, bounds, diffeq_solver=dfx.Tsit5(scan_kind="lax"), diffeq_adjoint=dfx.DirectAdjoint())
+    xs, length, _ = solve_inference_ivp(v0, metric, christoffel)
     print(f"length={length.item():.3f}")
     x_path, y_path, z_path = jax.vmap(manifold, out_axes=1)(xs)
     x0, y0, z0 = manifold(jnp.zeros_like(target))
@@ -416,8 +438,3 @@ def demo_torus():
 if __name__ == "__main__":
     # demo_torus()
     demo_qubit()
-
-
-# TODO:
-# - Failing to integrate the final single shooting piece -- why?
-# - Te initial z-component is flip-flopping back and forth at init. Why?
